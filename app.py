@@ -7,17 +7,17 @@ from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import roc_auc_score
 
-# Optional live refresh
+# Optional auto-refresh for dashboard
 try:
     from streamlit_autorefresh import st_autorefresh
 except Exception:
-    st_autorefresh = None  # fallback
+    st_autorefresh = None
 
 from response_rules import make_plan  # your existing rules file
 
-# ------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # CONFIG
-# ------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Climate-Aware DC Ops Demo", layout="wide")
 
 PAGES = [
@@ -31,144 +31,136 @@ PAGES = [
 ]
 page = st.sidebar.radio("Page", PAGES)
 
-# ------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # SMALL UTILITIES
-# ------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
-    """Strip whitespace; leave case as-is (so your existing code still works)."""
     return df.rename(columns=lambda c: c.strip())
 
 def ensure_columns(df: pd.DataFrame, required: list, func_name: str = ""):
     missing = [c for c in required if c not in df.columns]
     if missing:
-        raise ValueError(
-            f"{func_name}: missing columns {missing}. Available: {list(df.columns)}"
-        )
+        raise ValueError(f"{func_name}: missing columns {missing}. Available: {list(df.columns)}")
 
-# ------------------------------------------------------------------
-# DATA LOADING & MODEL
-# ------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
+# DATA LOADING
+# ────────────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
 def load_data():
     weather = pd.read_csv("weather_mock.csv", parse_dates=["date"])
     dc      = pd.read_csv("dc_mock.csv",     parse_dates=["date"])
     merged  = pd.read_csv("merged_training_sample.csv")
-    # Normalize just once here so everything downstream is consistent
-    weather = normalize_cols(weather)
-    dc      = normalize_cols(dc)
-    merged  = normalize_cols(merged)
-    return weather, dc, merged
+    return normalize_cols(weather), normalize_cols(dc), normalize_cols(merged)
 
-# ------- NOAA real data for one city (Sacramento, CA) -------------
+# NOAA real data for Sacramento, CA (optional)
 NOAA_ENDPOINT = "https://www.ncei.noaa.gov/cdo-web/api/v2/data"
-STATION_ID = "GHCND:USW00023232"   # Sacramento Exec Airport (example)
+STATION_ID    = "GHCND:USW00023232"  # Sacramento Executive Airport
 
 @st.cache_data(show_spinner=True)
 def fetch_noaa_daily_max(start="2019-01-01", end="2024-12-31"):
     token = st.secrets.get("NOAA_TOKEN", "")
     if not token:
-        return None  # no token set, skip
-    params = {
-        "datasetid": "GHCND",
-        "datatypeid": "TMAX",
-        "stationid": STATION_ID,
-        "startdate": start,
-        "enddate": end,
-        "limit": 1000,
-        "units": "standard"  # Fahrenheit
-    }
+        return None
+    params = dict(
+        datasetid="GHCND",
+        datatypeid="TMAX",
+        stationid=STATION_ID,
+        startdate=start,
+        enddate=end,
+        limit=1000,
+        units="standard"
+    )
     headers = {"token": token}
-    results = []
-    offset = 1
+    results, offset = [], 1
     while True:
         params["offset"] = offset
         r = requests.get(NOAA_ENDPOINT, headers=headers, params=params, timeout=15)
         if r.status_code != 200:
             break
-        data = r.json().get("results", [])
-        if not data:
+        chunk = r.json().get("results", [])
+        if not chunk:
             break
-        results.extend(data)
-        offset += len(data)
-        if len(data) < params["limit"]:
+        results.extend(chunk)
+        offset += len(chunk)
+        if len(chunk) < params["limit"]:
             break
-
     if not results:
         return None
-
     df = pd.DataFrame(results)
     df["date"] = pd.to_datetime(df["date"]).dt.normalize()
-    df = df.rename(columns={"value":"max_temp_F_noaa"})[["date","max_temp_F_noaa"]]
-    return df
+    return df.rename(columns={"value": "max_temp_F_noaa"})[["date", "max_temp_F_noaa"]]
 
-@st.cache_data(show_spinner=False)
-def get_model_and_features(merged_df):
-    # try loading cached model
+# ────────────────────────────────────────────────────────────────────
+# LOAD + PATCH DATA (NOAA) + REBUILD MERGED
+# ────────────────────────────────────────────────────────────────────
+weather, dc_raw, merged_initial = load_data()
+
+# Attach city/state to dc_raw (dc_mock.csv doesn't have them). Join on date.
+dc_enriched = dc_raw.merge(
+    weather[["date", "city", "state"]].drop_duplicates(),
+    on="date",
+    how="left"
+)
+
+# Optionally patch Sacramento temps with real NOAA
+noaa_df = fetch_noaa_daily_max()
+if noaa_df is not None:
+    weather = weather.merge(noaa_df, on="date", how="left")
+    sac_mask = (weather["city"] == "Sacramento") & (weather["state"] == "CA") & weather["max_temp_F_noaa"].notna()
+    weather.loc[sac_mask, "max_temp_F"] = weather.loc[sac_mask, "max_temp_F_noaa"]
+    # recompute derived features for all rows (simple + safe)
+    weather["rolling_max7"] = weather.groupby("city")["max_temp_F"].transform(lambda s: s.rolling(7, min_periods=1).max())
+    weather["humidity_idx"] = weather["humidity_pct"] * weather["max_temp_F"] / 100
+
+# Rebuild merged_df: join dc_enriched to weather features
+merged_df = dc_enriched.merge(
+    weather[["date","city","state","max_temp_F","rolling_max7","humidity_idx","extreme_heat_event"]],
+    on=["date","city","state"],
+    how="left"
+)
+
+# ────────────────────────────────────────────────────────────────────
+# MODEL
+# ────────────────────────────────────────────────────────────────────
+@st.cache_resource(show_spinner=False)
+def get_model_and_features(df):
+    features = ["max_temp_F","rolling_max7","humidity_idx","load_MW","cooling_kW"]
+    ensure_columns(df, features + ["extreme_heat_event"], "get_model_and_features")
+
     if os.path.exists("model.pkl"):
         try:
             model = joblib.load("model.pkl")
-            feats = pd.read_csv("feature_order.csv", header=None)[0].tolist()
+            feats  = pd.read_csv("feature_order.csv", header=None)[0].tolist()
             return model, feats
         except Exception:
             pass
-    # otherwise retrain
-    features = ["max_temp_F","rolling_max7","humidity_idx","load_MW","cooling_kW"]
-    ensure_columns(merged_df, features + ["extreme_heat_event"], "get_model_and_features")
-    X = merged_df[features]
-    y = merged_df["extreme_heat_event"]
-    X_tr, X_te, y_tr, y_te = train_test_split(
-        X, y, stratify=y, test_size=0.25, random_state=42
-    )
-    model = RandomForestClassifier(
-        n_estimators=250, class_weight="balanced", random_state=42
-    ).fit(X_tr, y_tr)
+
+    X = df[features]
+    y = df["extreme_heat_event"]
+    X_tr, X_te, y_tr, y_te = train_test_split(X, y, stratify=y, test_size=0.25, random_state=42)
+    model = RandomForestClassifier(n_estimators=250, class_weight="balanced", random_state=42).fit(X_tr, y_tr)
     auc = roc_auc_score(y_te, model.predict_proba(X_te)[:,1])
     st.caption(f"Demo model AUC: {auc:.3f}")
     joblib.dump(model, "model.pkl")
     pd.Series(features).to_csv("feature_order.csv", index=False)
     return model, features
 
-# Load raw data
-weather, dc, merged_df = load_data()
-
-# Try to blend real NOAA data for Sacramento
-noaa_df = fetch_noaa_daily_max()
-if noaa_df is not None:
-    mask = (weather["city"]=="Sacramento") & (weather["state"]=="CA")
-    weather = weather.merge(noaa_df, on="date", how="left")
-    # update temps only for Sacramento where NOAA gave us values
-    weather.loc[mask & weather["max_temp_F_noaa"].notna(), "max_temp_F"] = \
-        weather.loc[mask & weather["max_temp_F_noaa"].notna(), "max_temp_F_noaa"]
-    # recompute features for Sacramento rows
-    weather["rolling_max7"] = weather.groupby("city")["max_temp_F"].transform(
-        lambda s: s.rolling(7, min_periods=1).max()
-    )
-    weather["humidity_idx"] = weather["humidity_pct"] * weather["max_temp_F"] / 100
-    # rebuild merged
-    merged_df = dc.merge(weather, on=["date","city","state"], how="left")
-
-# Train / load model
 model, FEATURES = get_model_and_features(merged_df)
 
-# ------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # INVENTORY + MAP SUPPORT
-# ------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
 def build_inventory(dc_df: pd.DataFrame) -> pd.DataFrame:
-    df = normalize_cols(dc_df).copy()
-    required = ["dc_id","city","state","load_MW","cooling_kW"]
-    ensure_columns(df, required, "build_inventory")
+    # dc_df must have dc_id, city, state, load_MW, cooling_kW
+    ensure_columns(dc_df, ["dc_id","city","state","load_MW","cooling_kW"], "build_inventory")
+    inv = (dc_df.groupby("dc_id", as_index=False)
+                 .agg(city=("city","first"),
+                      state=("state","first"),
+                      avg_load_MW=("load_MW","mean"),
+                      avg_cooling_kW=("cooling_kW","mean")))
+    return inv.round({"avg_load_MW":2,"avg_cooling_kW":1})
 
-    inv = (df.groupby("dc_id", as_index=False)
-             .agg(city=("city", "first"),
-                  state=("state","first"),
-                  avg_load_MW=("load_MW","mean"),
-                  avg_cooling_kW=("cooling_kW","mean"))
-          )
-
-    return inv.round({"avg_load_MW":2, "avg_cooling_kW":1})
-
-# City lat/lon (rough centroids)
 CITY_LATLON = {
     ("Phoenix","AZ"): (33.4484, -112.0740),
     ("Sacramento","CA"): (38.5816, -121.4944),
@@ -192,30 +184,20 @@ CITY_LATLON = {
     ("Kansas City","MO"): (39.0997, -94.5786),
 }
 
-def add_latlon(inv_df):
+def add_latlon(inv_df: pd.DataFrame) -> pd.DataFrame:
     inv_df = inv_df.copy()
-    inv_df["lat"] = inv_df.apply(lambda r: CITY_LATLON.get((r.city, r.state), (np.nan,np.nan))[0], axis=1)
-    inv_df["lon"] = inv_df.apply(lambda r: CITY_LATLON.get((r.city, r.state), (np.nan,np.nan))[1], axis=1)
+    inv_df["lat"] = inv_df.apply(lambda r: CITY_LATLON.get((r.city, r.state), (np.nan, np.nan))[0], axis=1)
+    inv_df["lon"] = inv_df.apply(lambda r: CITY_LATLON.get((r.city, r.state), (np.nan, np.nan))[1], axis=1)
     return inv_df
 
-dc_inventory = build_inventory(dc)
-dc_inventory = add_latlon(dc_inventory)
+dc_inventory = add_latlon(build_inventory(dc_enriched))
 
-# (Optional) If you really want this extra merge, keep it guarded
-cols = ["date","city","state"]
-if set(cols).issubset(weather.columns):
-    base = dc.merge(weather[cols].drop_duplicates(), on=cols, how="left")
-    # Only rebuild if required cols are still present (they should be)
-    if {"load_MW","cooling_kW","dc_id"}.issubset(base.columns):
-        dc_inventory = build_inventory(base)
-
-# ------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # HELPERS
-# ------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 def score_day(date_obj):
-    """Score all DCs on a given date."""
     wday = weather[weather["date"].dt.date == date_obj]
-    dday = dc[dc["date"].dt.date == date_obj]
+    dday = dc_enriched[dc_enriched["date"].dt.date == date_obj]
     if wday.empty or dday.empty:
         return pd.DataFrame()
     day_all = dday.merge(
@@ -227,9 +209,9 @@ def score_day(date_obj):
     return day_all
 
 def risk_series_for_dc(dc_id, start_date=None, end_date=None):
-    dcdc = dc[dc["dc_id"]==dc_id]
-    if start_date: dcdc = dcdc[dcdc["date"]>=pd.Timestamp(start_date)]
-    if end_date:   dcdc = dcdc[dcdc["date"]<=pd.Timestamp(end_date)]
+    dcdc = dc_enriched[dc_enriched["dc_id"] == dc_id]
+    if start_date: dcdc = dcdc[dcdc["date"] >= pd.Timestamp(start_date)]
+    if end_date:   dcdc = dcdc[dcdc["date"] <= pd.Timestamp(end_date)]
     wsub = weather[weather["city"].isin(dcdc["city"].unique())]
     df = dcdc.merge(
         wsub[["date","max_temp_F","rolling_max7","humidity_idx","city","state"]],
@@ -248,24 +230,21 @@ def send_fake_webhook(url, payload):
     except Exception as e:
         return False, str(e)
 
-# ------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 # PAGES
-# ------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────
 
 if page == "🏠 Dashboard":
     st.title("Real-time-ish Dashboard")
-
-    # auto refresh every 5 seconds
     if st_autorefresh:
         st_autorefresh(interval=5000, key="refresh")
 
     today = weather["date"].max().date()
     scored = score_day(today)
 
-    c1,c2,c3,c4 = st.columns(4)
+    c1, c2, c3, c4 = st.columns(4)
     with c1: st.metric("# Data Centers", len(dc_inventory))
-    with c2:
-        st.metric("High-Risk DCs Today (≥0.7)", int((scored["risk"]>=0.7).sum()) if not scored.empty else "—")
+    with c2: st.metric("High-Risk DCs Today (≥0.7)", int((scored["risk"]>=0.7).sum()) if not scored.empty else "—")
     with c3:
         avg_temp = weather[weather["date"].dt.date==today]["max_temp_F"].mean()
         st.metric("Avg Max Temp Today (°F)", f"{avg_temp:.1f}" if not np.isnan(avg_temp) else "—")
@@ -335,7 +314,6 @@ Pick a scenario and see what might happen to operations/equipment.
     severity = st.slider("Severity (0 = minor, 1 = catastrophic)", 0.0, 1.0, 0.6, 0.05)
 
     st.subheader("Predicted Operational Impacts")
-    impacts = []
     if scen == "Extreme Heat":
         impacts = [
             "Cooling power spikes; PUE rises.",
@@ -357,16 +335,15 @@ Pick a scenario and see what might happen to operations/equipment.
             "Emergency shutdown of affected racks possible.",
             "Inspection/restart procedures post-event."
         ]
-    elif scen == "Full Outage":
+    else:  # Full Outage
         impacts = [
             "UPS→generator sequence kicks in.",
             "Runtime limits (fuel/battery) drive priorities.",
             "Graceful shutdown of non-essential systems.",
             "Data integrity & restart sequencing critical."
         ]
-    impacts = [f"{imp} (severity {severity:.2f})" for imp in impacts]
     for imp in impacts:
-        st.write("- ", imp)
+        st.write("- ", f"{imp} (severity {severity:.2f})")
 
     st.subheader("Suggested Mitigations (demo)")
     plan = make_plan(risk=max(severity,0.7) if scen=="Extreme Heat" else severity,
@@ -390,7 +367,7 @@ elif page == "🛠️ Action Engine":
     st.markdown("---")
     st.subheader("Simulated Auto-Execution")
     auto = st.checkbox("Send to a (fake) webhook?")
-    url = st.text_input("Webhook URL (leave empty to simulate)", value="")
+    url  = st.text_input("Webhook URL (leave empty to simulate)", value="")
     if auto:
         payload = {
             "timestamp": pd.Timestamp.utcnow().isoformat(),
@@ -440,31 +417,30 @@ elif page == "📊 Risk Forecast":
     st.title("Extreme Heat Risk Forecast (Single Day / DC)")
 
     all_dates = weather["date"].dt.date.unique()
-    pick_date = st.date_input("Date", value=all_dates[-1],
-                              min_value=all_dates[0], max_value=all_dates[-1])
-    dcs = dc["dc_id"].unique()
+    pick_date = st.date_input("Date", value=all_dates[-1], min_value=all_dates[0], max_value=all_dates[-1])
+    dcs = dc_enriched["dc_id"].unique()
     pick_dc = st.selectbox("Data Center ID", sorted(dcs))
 
     row_weather = weather[weather["date"].dt.date == pick_date]
-    row_dc      = dc[(dc["date"].dt.date == pick_date) & (dc["dc_id"]==pick_dc)]
+    row_dc      = dc_enriched[(dc_enriched["date"].dt.date == pick_date) & (dc_enriched["dc_id"] == pick_dc)]
 
     if row_weather.empty or row_dc.empty:
         st.warning("No data for that selection (demo limitation). Try another date / DC.")
     else:
-        wf = row_weather.iloc[0]
-        df_dc = row_dc.iloc[0]
+        wf   = row_weather.iloc[0]
+        drow = row_dc.iloc[0]
         X = pd.DataFrame([{
-            "max_temp_F": wf["max_temp_F"],
+            "max_temp_F":   wf["max_temp_F"],
             "rolling_max7": wf["rolling_max7"],
             "humidity_idx": wf["humidity_idx"],
-            "load_MW": df_dc["load_MW"],
-            "cooling_kW": df_dc["cooling_kW"]
+            "load_MW":      drow["load_MW"],
+            "cooling_kW":   drow["cooling_kW"]
         }])[FEATURES]
         risk = model.predict_proba(X)[:,1][0]
         st.metric("Predicted Heat Risk", f"{risk:.2f}")
 
         st.subheader("Feature Snapshot")
-        st.write(X.T.rename(columns={0:"value"}))
+        st.write(X.T.rename(columns={0: "value"}))
 
 elif page == "🧪 Data Fusion (raw)":
     st.title("Data Fusion: Combining Multiple Sources")
