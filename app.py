@@ -13,11 +13,11 @@ try:
 except Exception:
     st_autorefresh = None
 
-from response_rules import make_plan  # your existing rules file
+from response_rules import make_plan  # you already have this file
 
-# ────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 # CONFIG
-# ────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Climate-Aware DC Ops Demo", layout="wide")
 
 PAGES = [
@@ -31,9 +31,9 @@ PAGES = [
 ]
 page = st.sidebar.radio("Page", PAGES)
 
-# ────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 # SMALL UTILITIES
-# ────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
     return df.rename(columns=lambda c: c.strip())
 
@@ -42,9 +42,13 @@ def ensure_columns(df: pd.DataFrame, required: list, func_name: str = ""):
     if missing:
         raise ValueError(f"{func_name}: missing columns {missing}. Available: {list(df.columns)}")
 
-# ────────────────────────────────────────────────────────────────────
+def fmt_pct(x, decimals=1):
+    """0–1 float -> '##.#%' string."""
+    return f"{x*100:.{decimals}f}%"
+
+# ─────────────────────────────────────────────────────────────
 # DATA LOADING
-# ────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
 def load_data():
     weather = pd.read_csv("weather_mock.csv", parse_dates=["date"])
@@ -52,7 +56,7 @@ def load_data():
     merged  = pd.read_csv("merged_training_sample.csv")
     return normalize_cols(weather), normalize_cols(dc), normalize_cols(merged)
 
-# NOAA real data for Sacramento, CA (optional)
+# NOAA (optional) real temps for Sacramento, CA
 NOAA_ENDPOINT = "https://www.ncei.noaa.gov/cdo-web/api/v2/data"
 STATION_ID    = "GHCND:USW00023232"  # Sacramento Executive Airport
 
@@ -68,7 +72,7 @@ def fetch_noaa_daily_max(start="2019-01-01", end="2024-12-31"):
         startdate=start,
         enddate=end,
         limit=1000,
-        units="standard"
+        units="standard"  # Fahrenheit
     )
     headers = {"token": token}
     results, offset = [], 1
@@ -90,38 +94,38 @@ def fetch_noaa_daily_max(start="2019-01-01", end="2024-12-31"):
     df["date"] = pd.to_datetime(df["date"]).dt.normalize()
     return df.rename(columns={"value": "max_temp_F_noaa"})[["date", "max_temp_F_noaa"]]
 
-# ────────────────────────────────────────────────────────────────────
-# LOAD + PATCH DATA (NOAA) + REBUILD MERGED
-# ────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# LOAD + PATCH DATA + REBUILD MERGED
+# ─────────────────────────────────────────────────────────────
 weather, dc_raw, merged_initial = load_data()
 
-# Attach city/state to dc_raw (dc_mock.csv doesn't have them). Join on date.
+# Attach city/state to dc (dc_mock.csv lacks them); join on date
 dc_enriched = dc_raw.merge(
     weather[["date", "city", "state"]].drop_duplicates(),
     on="date",
     how="left"
 )
 
-# Optionally patch Sacramento temps with real NOAA
+# Optional: patch Sacramento temps with NOAA real data
 noaa_df = fetch_noaa_daily_max()
 if noaa_df is not None:
     weather = weather.merge(noaa_df, on="date", how="left")
     sac_mask = (weather["city"] == "Sacramento") & (weather["state"] == "CA") & weather["max_temp_F_noaa"].notna()
     weather.loc[sac_mask, "max_temp_F"] = weather.loc[sac_mask, "max_temp_F_noaa"]
-    # recompute derived features for all rows (simple + safe)
+    # recompute features for everyone (simple + safe)
     weather["rolling_max7"] = weather.groupby("city")["max_temp_F"].transform(lambda s: s.rolling(7, min_periods=1).max())
     weather["humidity_idx"] = weather["humidity_pct"] * weather["max_temp_F"] / 100
 
-# Rebuild merged_df: join dc_enriched to weather features
+# Rebuild merged_df with enriched dc + latest weather features
 merged_df = dc_enriched.merge(
     weather[["date","city","state","max_temp_F","rolling_max7","humidity_idx","extreme_heat_event"]],
     on=["date","city","state"],
     how="left"
 )
 
-# ────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 # MODEL
-# ────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def get_model_and_features(df):
     features = ["max_temp_F","rolling_max7","humidity_idx","load_MW","cooling_kW"]
@@ -147,12 +151,11 @@ def get_model_and_features(df):
 
 model, FEATURES = get_model_and_features(merged_df)
 
-# ────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 # INVENTORY + MAP SUPPORT
-# ────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
 def build_inventory(dc_df: pd.DataFrame) -> pd.DataFrame:
-    # dc_df must have dc_id, city, state, load_MW, cooling_kW
     ensure_columns(dc_df, ["dc_id","city","state","load_MW","cooling_kW"], "build_inventory")
     inv = (dc_df.groupby("dc_id", as_index=False)
                  .agg(city=("city","first"),
@@ -192,9 +195,9 @@ def add_latlon(inv_df: pd.DataFrame) -> pd.DataFrame:
 
 dc_inventory = add_latlon(build_inventory(dc_enriched))
 
-# ────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 # HELPERS
-# ────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 def score_day(date_obj):
     wday = weather[weather["date"].dt.date == date_obj]
     dday = dc_enriched[dc_enriched["date"].dt.date == date_obj]
@@ -206,6 +209,7 @@ def score_day(date_obj):
     )
     X = day_all[FEATURES]
     day_all["risk"] = model.predict_proba(X)[:,1]
+    day_all["risk_pct"] = day_all["risk"] * 100
     return day_all
 
 def risk_series_for_dc(dc_id, start_date=None, end_date=None):
@@ -219,7 +223,8 @@ def risk_series_for_dc(dc_id, start_date=None, end_date=None):
     )
     X = df[FEATURES]
     df["risk"] = model.predict_proba(X)[:,1]
-    return df[["date","risk","max_temp_F","rolling_max7","humidity_idx"]].sort_values("date")
+    df["risk_pct"] = df["risk"] * 100
+    return df[["date","risk","risk_pct","max_temp_F","rolling_max7","humidity_idx"]].sort_values("date")
 
 def send_fake_webhook(url, payload):
     if not url:
@@ -230,9 +235,9 @@ def send_fake_webhook(url, payload):
     except Exception as e:
         return False, str(e)
 
-# ────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 # PAGES
-# ────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 
 if page == "🏠 Dashboard":
     st.title("Real-time-ish Dashboard")
@@ -244,7 +249,9 @@ if page == "🏠 Dashboard":
 
     c1, c2, c3, c4 = st.columns(4)
     with c1: st.metric("# Data Centers", len(dc_inventory))
-    with c2: st.metric("High-Risk DCs Today (≥0.7)", int((scored["risk"]>=0.7).sum()) if not scored.empty else "—")
+    with c2:
+        st.metric("High-Risk DCs Today (≥70%)",
+                  int((scored["risk"]>=0.7).sum()) if not scored.empty else "—")
     with c3:
         avg_temp = weather[weather["date"].dt.date==today]["max_temp_F"].mean()
         st.metric("Avg Max Temp Today (°F)", f"{avg_temp:.1f}" if not np.isnan(avg_temp) else "—")
@@ -255,8 +262,11 @@ if page == "🏠 Dashboard":
     st.write("*(Values refresh every ~5 seconds.)*")
     if not scored.empty:
         st.subheader("Today’s Risk by Data Center")
-        st.dataframe(scored[["dc_id","city","state","risk","load_MW","cooling_kW"]]
-                     .sort_values("risk", ascending=False).round(3))
+        st.dataframe(
+            scored[["dc_id","city","state","risk_pct","load_MW","cooling_kW"]]
+            .sort_values("risk_pct", ascending=False)
+            .round(2)
+        )
     else:
         st.info("No rows for 'today' in the mock set.")
 
@@ -311,7 +321,8 @@ Pick a scenario and see what might happen to operations/equipment.
 """)
     scen = st.selectbox("Scenario", ["Extreme Heat","Grid Shortfall","Cooling Failure","Full Outage"])
     dc_id_pick = st.selectbox("Data Center", sorted(dc_inventory["dc_id"]))
-    severity = st.slider("Severity (0 = minor, 1 = catastrophic)", 0.0, 1.0, 0.6, 0.05)
+    severity_pct = st.slider("Severity (%)", 0, 100, 60, 5)
+    severity = severity_pct / 100.0
 
     st.subheader("Predicted Operational Impacts")
     if scen == "Extreme Heat":
@@ -343,7 +354,7 @@ Pick a scenario and see what might happen to operations/equipment.
             "Data integrity & restart sequencing critical."
         ]
     for imp in impacts:
-        st.write("- ", f"{imp} (severity {severity:.2f})")
+        st.write("- ", f"{imp} (severity {severity_pct}%)")
 
     st.subheader("Suggested Mitigations (demo)")
     plan = make_plan(risk=max(severity,0.7) if scen=="Extreme Heat" else severity,
@@ -354,9 +365,10 @@ Pick a scenario and see what might happen to operations/equipment.
 elif page == "🛠️ Action Engine":
     st.title("Automated Response Plan")
 
-    risk = st.slider("Risk Score (0–1)", 0.0, 1.0, 0.78, 0.01)
-    load = st.number_input("Current Load (MW)", 0.0, 200.0, 25.0, 0.1)
-    cool = st.number_input("Cooling Power (kW)", 0.0, 20000.0, 3000.0, 100.0)
+    risk_pct = st.slider("Risk (%)", 0, 100, 78, 1)
+    risk     = risk_pct / 100.0
+    load     = st.number_input("Current Load (MW)", 0.0, 200.0, 25.0, 0.1)
+    cool     = st.number_input("Cooling Power (kW)", 0.0, 20000.0, 3000.0, 100.0)
 
     plan = make_plan(risk, load, cool)
 
@@ -371,6 +383,7 @@ elif page == "🛠️ Action Engine":
     if auto:
         payload = {
             "timestamp": pd.Timestamp.utcnow().isoformat(),
+            "risk_pct": risk_pct,
             "risk": risk,
             "load_MW": load,
             "cooling_kW": cool,
@@ -395,10 +408,13 @@ elif page == "📈 Climate & Risk Outlook":
         import plotly.express as px
         col1, col2 = st.columns(2)
         with col1:
-            fig = px.line(df_risk, x="date", y="risk", title=f"Risk Score Over Time - {dc_pick}")
+            fig = px.line(df_risk, x="date", y="risk_pct",
+                          title=f"Risk (%) Over Time - {dc_pick}",
+                          labels={"risk_pct":"Risk (%)"})
             st.plotly_chart(fig, use_container_width=True)
         with col2:
-            fig2 = px.line(df_risk, x="date", y="max_temp_F", title="Max Temp (°F) Over Time")
+            fig2 = px.line(df_risk, x="date", y="max_temp_F",
+                           title="Max Temp (°F) Over Time")
             st.plotly_chart(fig2, use_container_width=True)
 
         st.subheader("Monthly Avg Max Temp (historical)")
@@ -417,7 +433,8 @@ elif page == "📊 Risk Forecast":
     st.title("Extreme Heat Risk Forecast (Single Day / DC)")
 
     all_dates = weather["date"].dt.date.unique()
-    pick_date = st.date_input("Date", value=all_dates[-1], min_value=all_dates[0], max_value=all_dates[-1])
+    pick_date = st.date_input("Date", value=all_dates[-1],
+                              min_value=all_dates[0], max_value=all_dates[-1])
     dcs = dc_enriched["dc_id"].unique()
     pick_dc = st.selectbox("Data Center ID", sorted(dcs))
 
@@ -437,7 +454,7 @@ elif page == "📊 Risk Forecast":
             "cooling_kW":   drow["cooling_kW"]
         }])[FEATURES]
         risk = model.predict_proba(X)[:,1][0]
-        st.metric("Predicted Heat Risk", f"{risk:.2f}")
+        st.metric("Predicted Heat Risk", fmt_pct(risk, 1))
 
         st.subheader("Feature Snapshot")
         st.write(X.T.rename(columns={0: "value"}))
