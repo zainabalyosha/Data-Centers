@@ -32,20 +32,38 @@ PAGES = [
 page = st.sidebar.radio("Page", PAGES)
 
 # ------------------------------------------------------------------
+# SMALL UTILITIES
+# ------------------------------------------------------------------
+def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """Strip whitespace; leave case as-is (so your existing code still works)."""
+    return df.rename(columns=lambda c: c.strip())
+
+def ensure_columns(df: pd.DataFrame, required: list, func_name: str = ""):
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"{func_name}: missing columns {missing}. Available: {list(df.columns)}"
+        )
+
+# ------------------------------------------------------------------
 # DATA LOADING & MODEL
 # ------------------------------------------------------------------
-@st.cache_resource(show_spinner=False)
+@st.cache_data(show_spinner=False)
 def load_data():
     weather = pd.read_csv("weather_mock.csv", parse_dates=["date"])
-    dc      = pd.read_csv("dc_mock.csv", parse_dates=["date"])
+    dc      = pd.read_csv("dc_mock.csv",     parse_dates=["date"])
     merged  = pd.read_csv("merged_training_sample.csv")
+    # Normalize just once here so everything downstream is consistent
+    weather = normalize_cols(weather)
+    dc      = normalize_cols(dc)
+    merged  = normalize_cols(merged)
     return weather, dc, merged
 
 # ------- NOAA real data for one city (Sacramento, CA) -------------
 NOAA_ENDPOINT = "https://www.ncei.noaa.gov/cdo-web/api/v2/data"
 STATION_ID = "GHCND:USW00023232"   # Sacramento Exec Airport (example)
 
-@st.cache_resource(show_spinner=True)
+@st.cache_data(show_spinner=True)
 def fetch_noaa_daily_max(start="2019-01-01", end="2024-12-31"):
     token = st.secrets.get("NOAA_TOKEN", "")
     if not token:
@@ -79,11 +97,11 @@ def fetch_noaa_daily_max(start="2019-01-01", end="2024-12-31"):
         return None
 
     df = pd.DataFrame(results)
-    df["date"] = pd.to_datetime(df["date"]).dt.date
+    df["date"] = pd.to_datetime(df["date"]).dt.normalize()
     df = df.rename(columns={"value":"max_temp_F_noaa"})[["date","max_temp_F_noaa"]]
     return df
 
-@st.cache_resource(show_spinner=False)
+@st.cache_data(show_spinner=False)
 def get_model_and_features(merged_df):
     # try loading cached model
     if os.path.exists("model.pkl"):
@@ -95,6 +113,7 @@ def get_model_and_features(merged_df):
             pass
     # otherwise retrain
     features = ["max_temp_F","rolling_max7","humidity_idx","load_MW","cooling_kW"]
+    ensure_columns(merged_df, features + ["extreme_heat_event"], "get_model_and_features")
     X = merged_df[features]
     y = merged_df["extreme_heat_event"]
     X_tr, X_te, y_tr, y_te = train_test_split(
@@ -115,16 +134,18 @@ weather, dc, merged_df = load_data()
 # Try to blend real NOAA data for Sacramento
 noaa_df = fetch_noaa_daily_max()
 if noaa_df is not None:
-    noaa_df["date"] = pd.to_datetime(noaa_df["date"])
     mask = (weather["city"]=="Sacramento") & (weather["state"]=="CA")
     weather = weather.merge(noaa_df, on="date", how="left")
+    # update temps only for Sacramento where NOAA gave us values
     weather.loc[mask & weather["max_temp_F_noaa"].notna(), "max_temp_F"] = \
         weather.loc[mask & weather["max_temp_F_noaa"].notna(), "max_temp_F_noaa"]
     # recompute features for Sacramento rows
-    weather["rolling_max7"] = weather.groupby("city")["max_temp_F"].transform(lambda s: s.rolling(7, min_periods=1).max())
+    weather["rolling_max7"] = weather.groupby("city")["max_temp_F"].transform(
+        lambda s: s.rolling(7, min_periods=1).max()
+    )
     weather["humidity_idx"] = weather["humidity_pct"] * weather["max_temp_F"] / 100
     # rebuild merged
-    merged_df = dc.merge(weather, on=["date","city","state"])
+    merged_df = dc.merge(weather, on=["date","city","state"], how="left")
 
 # Train / load model
 model, FEATURES = get_model_and_features(merged_df)
@@ -132,17 +153,19 @@ model, FEATURES = get_model_and_features(merged_df)
 # ------------------------------------------------------------------
 # INVENTORY + MAP SUPPORT
 # ------------------------------------------------------------------
-@st.cache_resource(show_spinner=False)
-def build_inventory(dc_df):
-    inv = (
-        dc_df.groupby("dc_id")
+@st.cache_data(show_spinner=False)
+def build_inventory(dc_df: pd.DataFrame) -> pd.DataFrame:
+    df = normalize_cols(dc_df).copy()
+    required = ["dc_id","city","state","load_MW","cooling_kW"]
+    ensure_columns(df, required, "build_inventory")
+
+    inv = (df.groupby("dc_id", as_index=False)
              .agg(city=("city", "first"),
                   state=("state","first"),
                   avg_load_MW=("load_MW","mean"),
                   avg_cooling_kW=("cooling_kW","mean"))
-             .reset_index()
-             .sort_values("dc_id")
-    )
+          )
+
     return inv.round({"avg_load_MW":2, "avg_cooling_kW":1})
 
 # City lat/lon (rough centroids)
@@ -178,17 +201,13 @@ def add_latlon(inv_df):
 dc_inventory = build_inventory(dc)
 dc_inventory = add_latlon(dc_inventory)
 
-# ------------------------------------------------------------------
-
-#extra 
-
+# (Optional) If you really want this extra merge, keep it guarded
 cols = ["date","city","state"]
 if set(cols).issubset(weather.columns):
     base = dc.merge(weather[cols].drop_duplicates(), on=cols, how="left")
-else:
-    base = dc  # fall back if weather lost those cols
-dc_inventory = build_inventory(base)
-
+    # Only rebuild if required cols are still present (they should be)
+    if {"load_MW","cooling_kW","dc_id"}.issubset(base.columns):
+        dc_inventory = build_inventory(base)
 
 # ------------------------------------------------------------------
 # HELPERS
