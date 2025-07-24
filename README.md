@@ -1,4 +1,4 @@
-# Climate-Aware Data Center Heat Risk Demo
+# Climate Change - Data Center Heat Risk Demo
 
 **Purpose:** Concept demo for a system that fuses weather/climate data and data-center telemetry to predict heat-driven extreme events and auto-generate pre-emptive action plans (load shift, BESS charge, cooling tweaks).
 
