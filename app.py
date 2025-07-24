@@ -175,7 +175,7 @@ def add_latlon(inv_df):
     inv_df["lon"] = inv_df.apply(lambda r: CITY_LATLON.get((r.city, r.state), (np.nan,np.nan))[1], axis=1)
     return inv_df
 
-dc_inventory = build_inventory(dc.merge(weather[["date","city","state"]], on=["date","city","state"]))
+dc_inventory = build_inventory(dc)
 dc_inventory = add_latlon(dc_inventory)
 
 # ------------------------------------------------------------------
