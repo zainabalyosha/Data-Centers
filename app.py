@@ -179,6 +179,18 @@ dc_inventory = build_inventory(dc)
 dc_inventory = add_latlon(dc_inventory)
 
 # ------------------------------------------------------------------
+
+#extra 
+
+cols = ["date","city","state"]
+if set(cols).issubset(weather.columns):
+    base = dc.merge(weather[cols].drop_duplicates(), on=cols, how="left")
+else:
+    base = dc  # fall back if weather lost those cols
+dc_inventory = build_inventory(base)
+
+
+# ------------------------------------------------------------------
 # HELPERS
 # ------------------------------------------------------------------
 def score_day(date_obj):
